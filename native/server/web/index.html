@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>短剧视界</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/home" id="brand">短剧视界</a>
+      <select id="source" class="source" title="站源"></select>
+      <a class="fav-btn" id="custom-sources-btn" href="#/custom-sources">自定义源</a>
+      <a class="fav-btn" id="visibility-btn" href="#/source-visibility" title="源显示列表">源显示</a>
+      <a class="fav-btn" id="live-btn" href="#/live" title="直播">直播</a>
+      <a class="fav-btn" id="favorites-btn" href="#/favorites">收藏夹</a>
+      <form id="search-form" class="search">
+        <input id="search-input" type="search" placeholder="搜索剧名" autocomplete="off" />
+        <label id="all-sources-label" class="all-sources" title="勾选后搜索并并发聚合所有可见源（含自定义源），不勾选只搜当前源">
+          <input id="all-sources" type="checkbox" />
+          全部源
+        </label>
+        <button type="submit">搜索</button>
+      </form>
+    </header>
+    <main id="view" class="view"></main>
+    <script src="hls.min.js"></script>
+    <script src="flv.min.js"></script>
+    <script src="artplayer.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,406 @@
+name: Build app packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-build-${{ github.workflow }}-${{ github.ref }}
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - &setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - &setup-flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: dart format --output=none --set-exit-if-changed lib test
+        continue-on-error: true
+      - run: dart analyze --fatal-infos lib test
+        continue-on-error: true
+      # 测试当前不阻塞出包（开发优先、集中验证暂缓），结果仍会显示在运行详情里。
+      - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true
+        continue-on-error: true
+      - run: flutter test --dart-define=DISABLE_REMOTE_IMAGES=true --dart-define=ALL_SOURCES=true
+        continue-on-error: true
+      - run: go test -race ./...
+        working-directory: native
+        continue-on-error: true
+      - run: go test -race -ldflags="-X duanjuapp/native/core.buildAllSources=true" ./...
+        working-directory: native
+        continue-on-error: true
+
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "只能从 main 分支手动发布，当前为 $GITHUB_REF。" >&2
+            exit 1
+          fi
+          version=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | head -n1)
+          if [ -z "$version" ]; then
+            echo "pubspec.yaml 缺少 version。" >&2
+            exit 1
+          fi
+          tag="app-v${version//+/-}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 || gh release view "$tag" >/dev/null 2>&1; then
+            echo "::warning::版本 $version（$tag）已发布过，本次将覆盖更新该 release 的备注与资产。"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy: &editions
+      fail-fast: false
+      matrix:
+        include:
+          - edition: duanjushijie
+            arguments: ''
+          - edition: quanjushijie
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+      - &setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - *setup-go
+      - *setup-flutter
+      # 构建机磁盘紧张（曾出现 stripReleaseDebugSymbols: No space left on device），
+      # 在装 Android SDK / NDK 之前清掉用不到的预装工具链与 Docker 缓存，腾出空间。
+      - name: Free up runner disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      # android-actions/setup-android@v3 在新 ubuntu 镜像上不稳定：
+      # free-disk-space 删掉预装 SDK 后，它对 /usr/local/lib/android 的 mkdir
+      # 报 EACCES，且即便重定向 ANDROID_SDK_ROOT 其行为仍不可控。
+      # 改为手动把 SDK/NDK 装进一定可写的 $RUNNER_TEMP/android-sdk，可复现且不依赖第三方 action。
+      - name: Set up Android SDK (manual into $RUNNER_TEMP)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${RUNNER_TEMP}/android-sdk"
+          export ANDROID_SDK_ROOT="${ANDROID_HOME}"
+          export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/28.2.13676358"
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}"
+          mkdir -p "${ANDROID_HOME}/cmdline-tools"
+          curl -fsSLo cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip
+          unzip -q cmdtools.zip -d "${ANDROID_HOME}/cmdline-tools"
+          mv "${ANDROID_HOME}/cmdline-tools/cmdline-tools" "${ANDROID_HOME}/cmdline-tools/latest"
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-36" "ndk;28.2.13676358" "build-tools;35.0.0"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+          echo "${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools" >> "$GITHUB_PATH"
+      # 诊断：关键组件缺失时在此明确报错（打印实际缺失项），避免 build_android.py
+      # 里 CGO 交叉编译阶段报成泛化的 "exit code 1"。
+      - name: Verify Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 复现 build_native.py 的取值逻辑：优先 ANDROID_NDK_HOME，否则 sdk/ndk/28.2.13676358
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          ndk_root="${ANDROID_NDK_HOME:-${sdk}/ndk/28.2.13676358}"
+          echo "ANDROID_HOME=${ANDROID_HOME}  ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}  ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-<unset>}"
+          echo "build_native.py 将使用的 NDK = ${ndk_root}"
+          ndk_bin="${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for c in aarch64-linux-android24-clang armv7a-linux-androideabi24-clang x86_64-linux-android24-clang; do
+            if [ ! -x "${ndk_bin}/${c}" ]; then
+              echo "缺少 NDK 编译器：${ndk_bin}/${c}" >&2
+              echo "---- 实际 ndk_bin 目录 ----"; ls -la "${ndk_bin}/" 2>&1 || true
+              echo "---- 实际 ndk_root 目录 ----"; ls -la "${ndk_root}" 2>&1 || true
+              echo "---- 实际 sdk 根目录 ----"; ls -la "${sdk}" 2>&1 || true
+              exit 1
+            fi
+          done
+          bt=$(find "${sdk}/build-tools" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -n1 || true)
+          if [ -z "${bt}" ]; then
+            echo "未找到 build-tools（AGP 需要）" >&2; exit 1
+          fi
+          echo "toolchain OK: NDK $(ls "${ndk_bin}" | grep -c clang) 个 clang（${ndk_root}），build-tools=${bt##*/}"
+      # Flutter 工具链是 composite build（includeBuild flutter_tools/gradle），它的
+      # settings 只配了 dependencyResolutionManagement、没配 pluginManagement.repositories，
+      # 于是它 buildscript 里的 kotlin jvm 2.2.20 插件（→ kotlin-stdlib:2.2.21）只在默认的
+      # gradlePluginPortal 上解析——而门户不托管这个普通库 → "Could not find kotlin-stdlib:2.2.21"。
+      # 之前靠暖 Gradle 缓存没暴露；free-disk-space 清缓存后必须在线解析才报错。
+      # 用 init script 给「root + 每个 included build」的 pluginManagement 补 mavenCentral，
+      # 不改 SDK 文件、不碰 FAIL_ON_PROJECT_REPOS（那是 dependencyResolutionManagement，另一块）。
+      - name: Add Gradle init script (mavenCentral into every build's plugin classpath)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.gradle/init.d"
+          printf '%s\n' \
+            'beforeSettings { settings ->' \
+            '    settings.pluginManagement {' \
+            '        repositories {' \
+            '            mavenCentral()' \
+            '            gradlePluginPortal()' \
+            '            google()' \
+            '        }' \
+            '    }' \
+            '}' > "${HOME}/.gradle/init.d/flutter-repos.init.gradle"
+          echo "wrote ${HOME}/.gradle/init.d/flutter-repos.init.gradle:"
+          cat "${HOME}/.gradle/init.d/flutter-repos.init.gradle"
+      - name: Configure Android signing
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::未配置签名 Secrets，本次 Android 使用 debug 签名出包（仅测试用；正式发布请在仓库 Secrets 配置 ANDROID_KEYSTORE_* 后再跑）。"
+            echo "mode=debug" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/release.jks" || {
+            echo "ANDROID_KEYSTORE_BASE64 不是合法 base64。" >&2
+            exit 1
+          }
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+      - run: python scripts/build_android.py ${{ matrix.arguments }}
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: 校验 APK 签名证书
+        if: steps.signing.outputs.mode == 'release'
+        shell: bash
+        env:
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s' "$ANDROID_CERT_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$expected" ]; then
+            echo "未设置仓库变量 ANDROID_CERT_SHA256，无法确认发布证书。" >&2
+            exit 1
+          fi
+          apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n1 || true)
+          if [ -z "$apksigner" ]; then
+            sdkmanager 'build-tools;35.0.0' >/dev/null
+            apksigner=$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort | tail -n1)
+          fi
+          echo "apksigner：$apksigner"
+          "$apksigner" --version || true
+          for apk in dist/android/*.apk; do
+            echo "== $(basename "$apk")"
+            output=$("$apksigner" verify --print-certs "$apk" 2>&1 || true)
+            printf '%s\n' "$output"
+            if ! printf '%s' "$output" | tr -d ':' | tr '[:upper:]' '[:lower:]' | grep "$expected" >/dev/null; then
+              echo "签名证书与发布证书不一致，已终止。" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-android
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy: *editions
+    steps:
+      - uses: actions/checkout@v4
+      - *setup-go
+      - *setup-python
+      - *setup-flutter
+      - name: Set up MinGW-w64
+        shell: pwsh
+        run: |
+          choco install mingw --no-progress -y
+          $exe = Get-ChildItem -Path 'C:\ProgramData\mingw64', 'C:\ProgramData\chocolatey\lib\mingw' `
+                   -Recurse -Include 'x86_64-w64-mingw32-gcc.exe', 'gcc.exe' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { $exe = (Get-Command x86_64-w64-mingw32-gcc -ErrorAction SilentlyContinue).Source }
+          if (-not $exe) { throw 'MinGW-w64 安装失败，找不到 gcc' }
+          Split-Path $exe | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $exe --version | Select-Object -First 1
+      - run: python scripts/build_windows.py ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-windows
+          path: dist/windows/*
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy: *editions
+    steps:
+      - uses: actions/checkout@v4
+      - *setup-python
+      - *setup-go
+      - *setup-flutter
+      - name: Check Xcode and CocoaPods
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --find clang
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+          pod --version
+          go version
+          flutter --version
+          flutter precache --ios
+      - name: Build unsigned iOS packages
+        run: python scripts/build_ios.py ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-ios-unsigned
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14
+
+  web:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - *setup-go
+      - *setup-python
+      - name: Build local service edition (短剧视界 / 全剧视界)
+        run: python scripts/build_web.py
+      # 两个单独版本 zip 只随 guoappweb.zip 合集发布，不在 release 里单独出资产。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: dist/web/guoappweb.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [checks, prepare, android, windows, ios, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ANDROID_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          版本 ${VERSION}。两个版本功能相同，区别只在站源范围，按需选择：
+
+          - 短剧视界 duanjushijie：仅红果站源
+          - 全剧视界 quanjushijie：全部站源
+
+          Android：
+          - *-arm64-v8a.apk：适用于较新的安卓设备
+          - *-armeabi-v7a.apk：适用于较老的安卓设备，电视推荐使用此版本
+          - *-x86_64.apk：适用于模拟器
+
+          iOS：
+          - *-ios-unsigned.ipa：未签名 IPA，可用相关工具安装
+
+          Windows：
+          - *-windows-x64.zip：解压后运行 duanjushijie.exe 或 quanjushijie.exe
+
+          本地服务版（web/guoappweb.zip）：
+          - guoappweb.zip：短剧视界 / 全剧视界 两个版本的合集（解压后得到 duanjushijie.zip / quanjushijie.zip，含 SHA256SUMS.txt）
+          - 两个版本 zip 内均已内置 Windows 版 ffmpeg.exe，解压后双击 start.bat（Windows）或执行 sh start.sh（macOS/Linux），浏览器打开 http://127.0.0.1:8000/web/
+
+          签名证书 SHA-256：${ANDROID_CERT_SHA256}
+          EOF
+          changes="$(awk -v heading="## ${VERSION}" '
+            $0 == heading { found = 1; next }
+            found && /^## / { exit }
+            found && !started && /^[[:space:]]*$/ { next }
+            found { started = 1; print }
+          ' CHANGELOG.md)"
+          printf '%s' "$changes" > changes.md
+          if [ -n "$changes" ]; then
+            { printf '更新内容：\n\n%s\n\n' "$changes"; cat notes.md; } > notes.tmp
+            mv notes.tmp notes.md
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，覆盖更新（删除后重建）。"
+            gh release delete "$TAG" --cleanup-tag -y
+          fi
+          gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "短剧视界 / 全剧视界 ${VERSION}" --notes-file notes.md
+      - name: 推送到 Telegram 频道
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "未配置 Telegram，跳过推送。"
+            exit 0
+          fi
+          changes="$(cat changes.md)"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          text="短剧视界 / 全剧视界 ${VERSION} 已发布"
+          if [ -n "$changes" ]; then
+            text="$(printf '%s\n\n更新内容：\n\n%s' "$text" "${changes:0:3500}")"
+          fi
+          text="$(printf '%s\n\n下载：%s' "$text" "$url")"
+          curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${text}" >/dev/null
