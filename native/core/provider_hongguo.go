@@ -217,14 +217,10 @@ func (d *Downloader) resolveHongguoMedia(ctx context.Context, task Task) (provid
 	if pageErr == nil {
 		return media, nil
 	}
-	if err := ctx.Err(); err != nil {
-		return providerMedia{}, err
-	}
-	media, apiErr := d.resolveHongguoPlaybackAPI(ctx, seriesID, videoID)
-	if apiErr == nil {
-		return media, nil
-	}
-	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%v；备用取流失败：%w", publicError(nativeErr), publicError(pageErr), apiErr)
+	// 原有的第三方备用取流接口（djapi.999888456.xyz）已长期返回 HTTP 525，
+	// 服务端 TLS 握手失败且无恢复迹象，已在本分支移除，避免每次播放失败都要
+	// 白等一轮超时、并把无关的 525 混进用户可见的错误文案里。
+	return providerMedia{}, fmt.Errorf("红果 App 取流失败：%v；网页取流失败：%w", publicError(nativeErr), pageErr)
 }
 
 func (d *Downloader) resolveHongguoWebMedia(ctx context.Context, seriesID, videoID string) (providerMedia, error) {

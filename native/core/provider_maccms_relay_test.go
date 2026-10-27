@@ -80,7 +80,6 @@ func TestIsHongguoProviderURL(t *testing.T) {
 	for _, u := range []string{
 		"https://hongguoduanju.com/detail?series_id=123",
 		"https://www.hongguoduanju.com/category/drama",
-		"https://djapi.999888456.xyz/api/hongguo/play?id=abc",
 		"http://HONGGUODUANJU.COM/xxx", // 大小写不敏感
 	} {
 		if !isHongguoProviderURL(u) {
@@ -91,6 +90,8 @@ func TestIsHongguoProviderURL(t *testing.T) {
 		"https://cfkua.wokaotianshi.eu.org/https://subocj.com/api.php/provide/vod/",
 		"https://example.com/detail?series_id=123",
 		"https://hongguoduanju.com.evil.com/", // 仿冒 host，不应误判
+		// 已下线的第三方备用取流接口（长期 HTTP 525），移除后不应再被当作红果 host
+		"https://djapi.999888456.xyz/api/hongguo/play?id=abc",
 		"",
 	} {
 		if isHongguoProviderURL(u) {

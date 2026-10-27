@@ -2,6 +2,12 @@
 
 每个版本一节，标题为 `pubspec.yaml` 中的完整版本号。发布工作流会把对应一节写入 GitHub Release 说明。
 
+## 未发布
+
+- 移除红果备用取流接口：`djapi.999888456.xyz` 已长期返回 HTTP 525（源站 TLS 握手失败），确认下线。相关常量、请求/响应结构、`resolveHongguoPlaybackAPI` 与响应解密代码一并删除，红果取流不再在失败后白等这一轮超时，错误文案也不再夹带无关的 525。
+- 红果 host 判定同步收敛为 `hongguoduanju.com` / `www.hongguoduanju.com`，已下线的备用接口不再被当作红果源排除在 CF 中继之外；`TestIsHongguoProviderURL` 补上该用例。
+- 验证：`go build ./core/ ./bridge/ ./server/` 通过，`go test ./core/ -run TestIsHongguoProviderURL` 通过。
+
 ## 0.3.1+90
 
 本版重点是**修掉 Windows 上的闪退**，三类根因已全部定位并修复（详见 README「Windows 稳定性」）。
