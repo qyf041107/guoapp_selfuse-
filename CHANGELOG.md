@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- 修复红果播放「红果 App 接口未返回有效数据」：旧 `/novel/player/video_model/v1/` 单集接口现在返回空正文（设备未注册 / 签名不被接受）。取流改为「匿名播放设备注册 + 六签名批量接口」：先调用 `log5-applog-lf.fqnovel.com/service/2/device_register/` 注册匿名设备（gzip + SHA-512 + AES-128-CBC 编码），再以该设备号、安装号、cdid 请求 `/novel/player/multi_video_model/v1/`，按需生成 X-Gorgon / X-Khronos / X-Ladon / X-Argus / X-Helios / X-Medusa 六种签名；返回的 `video_model` 若只给 `fallback_api`，再取 `video_info.data` 并用 `key_seed` 派生 AES-128-CBC 密钥解出媒体地址。原单集接口保留为兼容回退，注册失败或空响应时仍按「匿名注册 → 兼容注册 → 旧接口 → 预加载 → 官网网页」顺序降级。
+- 实测（2026-10-30，本机直连红果）：剧集 `7690961604636052505` 的第 1、2 集均返回 1080P 媒体地址、16 字节 CENC 密钥与 2 条线路，耗时约 0.4–0.7 秒；修复前同一请求返回「红果 App 接口未返回有效数据」。
+- 新增文件沿用上游 `xiaoguan521/guoapp` 的 GPL-3.0-only 实现（`provider_hongguo_pure_sign.go`、`provider_hongguo_playback_device.go`、`provider_hongguo_signed_media.go`、`provider_hongguo_fallback_media.go`、`provider_hongguo_spade.go`、`network_hongguo_alpn.go`），文件头保留 SPDX 标识与来源说明。
+- 验证：`go build ./core/` 通过，`go test ./core -run Hongguo` 全部通过，`go test ./...` 仅剩两个与本次改动无关的既有失败（`TestDanmakuTruncationKeepsEmojiIntact`、`TestDuanjuRejectsMismatchedSourceIDsAndCategories`，在未修改的 HEAD 上同样失败）。
 - 移除红果备用取流接口：`djapi.999888456.xyz` 已长期返回 HTTP 525（源站 TLS 握手失败），确认下线。相关常量、请求/响应结构、`resolveHongguoPlaybackAPI` 与响应解密代码一并删除，红果取流不再在失败后白等这一轮超时，错误文案也不再夹带无关的 525。
 - 红果 host 判定同步收敛为 `hongguoduanju.com` / `www.hongguoduanju.com`，已下线的备用接口不再被当作红果源排除在 CF 中继之外；`TestIsHongguoProviderURL` 补上该用例。
 - 验证：`go build ./core/ ./bridge/ ./server/` 通过，`go test ./core/ -run TestIsHongguoProviderURL` 通过。

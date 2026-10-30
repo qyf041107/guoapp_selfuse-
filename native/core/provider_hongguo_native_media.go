@@ -16,36 +16,123 @@ func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoI
 	if !hongguoNumericID.MatchString(videoID) {
 		return providerMedia{}, errors.New("红果视频 ID 无效")
 	}
+	media, signedErr := downloader.resolveHongguoRegisteredMedia(ctx, videoID)
+	if signedErr == nil {
+		downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.registered_resolved", Level: "info", Source: sourceHongguo, RequestedQuality: media.Quality})
+		return media, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return providerMedia{}, err
+	}
+	downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.registered_failed", Level: "warning", Source: sourceHongguo, Message: publicError(signedErr).Error()})
+	legacyCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	media, legacyErr := downloader.resolveHongguoLegacyAppMedia(legacyCtx, videoID)
+	if legacyErr == nil {
+		return media, nil
+	}
+	return providerMedia{}, fmt.Errorf("匿名设备取流：%v；兼容取流：%w", publicError(signedErr), legacyErr)
+}
+
+func (downloader *Downloader) resolveHongguoLegacyAppMedia(ctx context.Context, videoID string) (providerMedia, error) {
+	identity, err := downloader.hongguoPlaybackDevice(ctx)
+	if err != nil {
+		identity, err = downloader.hongguoPlaybackDeviceSession(ctx, true)
+		if err != nil {
+			return providerMedia{}, err
+		}
+	}
+	ctx = context.WithValue(ctx, hongguoPlaybackIdentityKey{}, identity)
 	payload := map[string]any{
 		"video_id": videoID, "content_type": 1,
 		"biz_param": map[string]any{"need_all_video_definition": true, "video_platform": 3},
 	}
-	result, err := downloader.hongguoAppRequest(ctx, http.MethodPost, "/novel/player/video_model/v1/", nil, payload)
+	singleCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	result, err := downloader.hongguoAppRequest(singleCtx, http.MethodPost, "/novel/player/video_model/v1/", nil, payload)
+	cancel()
 	if err != nil {
-		return providerMedia{}, err
+		return downloader.resolveHongguoPreloadMedia(ctx, videoID, err)
 	}
-	data := nestedMap(result, "data")
-	model, _ := data["video_model"].(map[string]any)
-	if encoded, ok := data["video_model"].(string); ok && encoded != "" {
-		if decoded, err := decodeHongguoBase64(encoded); err == nil && len(decoded) > 0 {
+	model, err := hongguoVideoModel(nestedMap(result, "data"))
+	if err != nil {
+		return downloader.resolveHongguoPreloadMedia(ctx, videoID, err)
+	}
+	media, err := selectHongguoAppMedia(model)
+	if err != nil {
+		return downloader.resolveHongguoPreloadMedia(ctx, videoID, err)
+	}
+	return media, nil
+}
+
+func hongguoVideoModel(entry map[string]any) (map[string]any, error) {
+	model, _ := entry["video_model"].(map[string]any)
+	if encoded, ok := entry["video_model"].(string); ok && strings.TrimSpace(encoded) != "" {
+		encoded = strings.TrimSpace(encoded)
+		if !strings.HasPrefix(encoded, "{") {
+			decoded, err := decodeHongguoBase64(encoded)
+			if err != nil {
+				return nil, errors.New("红果 App 播放信息编码异常")
+			}
 			encoded = string(decoded)
 		}
 		decoder := json.NewDecoder(strings.NewReader(encoded))
 		decoder.UseNumber()
-		if err := decoder.Decode(&model); err != nil {
-			return providerMedia{}, errors.New("红果 App 播放信息格式异常")
+		if err := decoder.Decode(&model); err != nil || len(model) == 0 {
+			return nil, errors.New("红果 App 播放信息格式异常")
+		}
+	}
+	if len(model) == 0 && entry["video_list"] != nil {
+		model = map[string]any{
+			"video_list": entry["video_list"], "video_duration": entry["video_duration"], "duration": entry["duration"],
 		}
 	}
 	if len(model) == 0 {
-		if rows := anyList(data["video_list"]); len(rows) > 0 {
-			model = map[string]any{
-				"video_list":     data["video_list"],
-				"video_duration": data["video_duration"],
-				"duration":       data["duration"],
-			}
-		}
+		return nil, errors.New("红果 App 未返回本集播放信息")
 	}
-	return selectHongguoAppMedia(model)
+	return model, nil
+}
+
+func (downloader *Downloader) resolveHongguoPreloadMedia(ctx context.Context, videoID string, previous error) (providerMedia, error) {
+	payload := map[string]any{
+		"biz_param": map[string]any{
+			"detail_page_version": 0, "device_level": 3, "disable_digg_stat": false,
+			"need_all_video_definition": true, "need_mp4_align": false,
+			"use_os_player": false, "use_server_dns": false, "video_platform": 1024,
+		},
+		"dr_scene":           "preload",
+		"mixed_video_id_map": map[string]any{"1004": []string{videoID}},
+	}
+	result, err := downloader.hongguoAppRequest(ctx, http.MethodPost, "/novel/player/multi_video_model/preload/v1", nil, payload)
+	if err != nil {
+		return providerMedia{}, fmt.Errorf("单集取流：%v；批量取流：%w", previous, err)
+	}
+	entry := nestedMap(nestedMap(result, "data"), videoID)
+	if len(entry) == 0 {
+		return providerMedia{}, errors.New("红果预加载接口未返回所选分集")
+	}
+	model, err := hongguoVideoModel(entry)
+	if err != nil {
+		return providerMedia{}, err
+	}
+	if len(hongguoFallbackRows(model["video_list"])) > 0 {
+		return selectHongguoAppMedia(model)
+	}
+	if fallback, fallbackErr := hongguoFallbackAPI(model); fallbackErr == nil {
+		data, err := downloader.fetchHongguoFallbackVideoData(ctx, fallback)
+		if err != nil {
+			return providerMedia{}, fmt.Errorf("单集取流：%v；批量取流：%w", previous, err)
+		}
+		media, err := hongguoMediaFromFallbackData(model, data)
+		if err != nil {
+			return providerMedia{}, fmt.Errorf("单集取流：%v；批量取流：%w", previous, err)
+		}
+		return media, nil
+	}
+	media, err := selectHongguoAppMedia(model)
+	if err != nil {
+		return providerMedia{}, fmt.Errorf("单集取流：%v；批量取流：%w", previous, err)
+	}
+	return media, nil
 }
 
 func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {
@@ -70,7 +157,7 @@ func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {
 	for _, row := range variants {
 		variant, _ := row.(map[string]any)
 		meta := nestedMap(variant, "video_meta")
-		codec := strings.ToLower(mapString(meta, "codec_type"))
+		codec := strings.ToLower(firstNonEmpty(mapString(meta, "codec_type"), mapString(variant, "codec_type")))
 		if codec == "bytevc2" || strings.Contains(strings.ToLower(mapString(variant, "gear_des_key")), "bytevc2") {
 			continue
 		}
@@ -80,10 +167,10 @@ func selectHongguoAppMedia(model map[string]any) (providerMedia, error) {
 		}
 		media := providerMedia{Referer: "https://novel.snssdk.com/", Duration: time.Duration(duration * float64(time.Second))}
 		encryption := nestedMap(variant, "encrypt_info")
-		spade := mapString(encryption, "spade_a")
+		spade := firstNonEmpty(mapString(encryption, "spade_a"), mapString(variant, "spade_a"))
 		if spade != "" || encryption["encrypt"] == true || mapString(encryption, "encryption_method") == "cenc-aes-ctr" {
 			var err error
-			media.CENCKey, err = hongguoContentKey(spade)
+			media.CENCKey, err = hongguoAppContentKey(spade)
 			if err != nil {
 				keyErr = err
 				continue

@@ -38,6 +38,8 @@ type hongguoCatalogState struct {
 }
 
 type hongguoAppClient struct {
+	playbackDevice       *hongguoPlaybackDeviceCall
+	compatPlaybackDevice *hongguoPlaybackDeviceCall
 	mu                  sync.Mutex
 	catalogMu           sync.Mutex
 	deviceMu            sync.Mutex
@@ -147,6 +149,9 @@ func (downloader *Downloader) hongguoAppRequest(ctx context.Context, method, pat
 	client.mu.Lock()
 	base, deviceID, installID := client.baseURL, client.state.DeviceID, client.state.InstallID
 	client.mu.Unlock()
+	if identity, ok := ctx.Value(hongguoPlaybackIdentityKey{}).(hongguoPlaybackIdentity); ok {
+		deviceID, installID = identity.deviceID, identity.installID
+	}
 	query := hongguoAppQuery(deviceID, installID)
 	for key, values := range extra {
 		query[key] = append([]string(nil), values...)
