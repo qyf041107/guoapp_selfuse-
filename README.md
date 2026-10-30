@@ -60,6 +60,27 @@ python3 scripts/build_web.py --edition quanjushijie   # 仅全剧视界版
 
 站源可用性、清晰度和区域限制取决于源站及网络；应用不解除源站 VIP 或其他授权限制。
 
+### 红果取流与排障（0.3.2+91）
+
+红果已不再接受只带「本地随机设备号 + X-Gorgon / X-Khronos」的请求：单集 `video_model` 接口会返回 HTTP 200 空正文，应用表现为「红果 App 接口未返回有效数据」。现在取流在原生核心内按以下顺序完成：
+
+1. **匿名播放设备注册**：向 `log5-applog-lf.fqnovel.com/service/2/device_register/` 发送 gzip + SHA-512 + AES-128-CBC 编码的注册包，取得 `device_id`、`install_id`，并在本机生成 `cdid`。注册身份只在当前进程内复用，不写入备份或同步记录。
+2. **批量取流**：用注册身份请求 `/novel/player/multi_video_model/v1/`，按时间戳与请求体生成 X-Gorgon、X-Khronos、X-Ladon、X-Argus、X-Helios、X-Medusa 六种签名。
+3. **解密**：响应只给 `fallback_api` 时，再取 `video_info.data`，用 `key_seed` 派生 AES-128-CBC 密钥解出媒体地址；`spade_a` 继续用于 CENC 内容密钥派生。
+4. **降级顺序**：匿名注册 → 兼容注册 → 旧单集接口 → 预加载备用请求 → 官网网页。全部失败才把错误显示给用户。
+
+排障对照：
+
+| 现象 | 含义与处理 |
+| --- | --- |
+| `匿名播放设备注册失败` | 注册被网络或风控拦截；切换网络后重试。刚恢复过备份到另一台设备时尤其容易触发 |
+| `红果播放接口空响应` | 签名或设备被拒；应用会自动再试兼容注册与旧接口，仍失败时隔几分钟再试 |
+| `红果批量接口未返回所选分集` | 该集已下架或只有试看；换集或在官网确认 |
+| `网页取流失败：HTTP 404` | 官网没有该集公开地址，属正常回退失败，不代表 App 取流失败 |
+| `红果 App 未返回兼容的媒体` | 只返回了 bytevc2 等不支持的编码；换线路或等源站补 H.264 |
+
+红果链路涉及 GPL-3.0-only 代码，来源、许可与本次改动记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 安装包与平台状态
 
 | 平台 | 包与状态 |
@@ -85,6 +106,61 @@ python3 scripts/build_web.py --edition quanjushijie   # 仅全剧视界版
 checks（格式、分析、测试不阻塞）、Android、Windows、iOS 全部成功后才创建 tag 和 Release；任一平台失败就不发布。已有 Release 不会被覆盖。手动发布流程为开发快照，尚未完成首次运行验证。
 
 Android 签名只使用仓库 Secrets：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`；同时需要配置仓库变量 `ANDROID_CERT_SHA256`（证书 SHA-256，冒号和大小写不限）。缺少任意一项都会发布失败。CI 通过环境变量把签名传给 Gradle；本机构建使用 `android/key.properties`。`key.properties` 和证书文件不入库。
+
+### Android 签名与升级
+
+正式 APK 必须用固定证书签名，否则新包无法覆盖安装。仓库不保存证书，只保存构建入口。
+
+**1. 先确认有没有旧证书。** 能覆盖升级手机上现有的全剧视界，说明必须复用当初签名的那把 keystore。先找本机 `android/key.properties`、备份盘、密码管理器，以及 GitHub 仓库的 Secrets。找不到旧证书只能用新证书，但新证书签的包**不能覆盖安装**，需要先卸载；卸载前在应用内「设置与备份」导出配置。
+
+**2. 生成本机 keystore**（需要 JDK 17）：
+
+```powershell
+keytool -genkeypair -v -keystore android\app\quanjushijie-release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias quanjushijie
+```
+
+**3. 写 `android/key.properties`**（已在 `.gitignore` 中，不会入库）：
+
+```properties
+storeFile=quanjushijie-release.jks
+storePassword=你的口令
+keyAlias=quanjushijie
+keyPassword=你的口令
+```
+
+`storeFile` 按 `android/app` 目录解析；写到别处时用绝对路径或相对路径均可，Gradle 找不到会再按 `android/` 根目录找一次。
+
+**4. 本地出包**：
+
+```powershell
+python scripts/build_android.py --all-sources
+```
+
+产物在 `dist/android`，文件名以 `quanjushijie-` 开头。没有 `key.properties` 时 Gradle 回退到 debug 证书，只能自己测试，不能覆盖正式安装。
+
+**5. 走 GitHub Actions 发布**：把 keystore 转成单行 base64 填进 Secrets：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("android\app\quanjushijie-release.jks")) | Set-Clipboard
+```
+
+| 类型 | 名称 | 值 |
+| --- | --- | --- |
+| Secret | `ANDROID_KEYSTORE_BASE64` | 上一步的 base64（单行，不要换行） |
+| Secret | `ANDROID_KEYSTORE_PASSWORD` | keystore 口令 |
+| Secret | `ANDROID_KEY_ALIAS` | `quanjushijie` |
+| Secret | `ANDROID_KEY_PASSWORD` | key 口令（通常与 keystore 口令相同） |
+| Variable | `ANDROID_CERT_SHA256` | 证书 SHA-256，去掉冒号、转大写 |
+
+证书指纹用下面命令查看，取 `SHA256:` 后面那串：
+
+```powershell
+keytool -list -v -keystore android\app\quanjushijie-release.jks -alias quanjushijie
+```
+
+配好后提升 `pubspec.yaml` 的 version，推送到 `main`，在 Actions 手动运行 **Build app packages**，从 Release 下载 `quanjushijie-*-android` 覆盖安装。
+
+> 包名（`com.duanju.duanju_app`）和证书必须与已安装版本一致。证书不同会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，只能卸载重装；卸载前先导出应用内备份。
 
 ## Windows 稳定性
 
