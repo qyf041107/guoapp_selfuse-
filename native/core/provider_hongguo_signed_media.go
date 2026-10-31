@@ -20,8 +20,6 @@ const (
 	hongguoSignedMediaUA  = "com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
 )
 
-var errHongguoPlaybackEmpty = errors.New("红果播放接口空响应，可能与设备鉴权或签名有关")
-
 func (downloader *Downloader) resolveHongguoRegisteredMedia(ctx context.Context, videoID string) (providerMedia, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -29,10 +27,58 @@ func (downloader *Downloader) resolveHongguoRegisteredMedia(ctx context.Context,
 	if err != nil {
 		return providerMedia{}, err
 	}
-	media, err := downloader.requestHongguoAppMedia(ctx, videoID, identity, false)
-	if errors.Is(err, errHongguoPlaybackEmpty) && ctx.Err() == nil {
-		return downloader.requestHongguoAppMedia(ctx, videoID, identity, true)
+
+	media, err := downloader.hongguoRegisteredAttempt(ctx, videoID, identity, false, 1)
+	if err == nil {
+		return media, nil
 	}
+	if ctx.Err() != nil {
+		return providerMedia{}, ctx.Err()
+	}
+	if !hongguoPlaybackAuthRetryable(err) {
+		return providerMedia{}, err
+	}
+
+	media, err = downloader.hongguoRegisteredAttempt(ctx, videoID, identity, true, 2)
+	if err == nil {
+		return media, nil
+	}
+	if ctx.Err() != nil {
+		return providerMedia{}, ctx.Err()
+	}
+	if !hongguoPlaybackAuthRetryable(err) {
+		return providerMedia{}, err
+	}
+
+	// 同一设备号在未签名和六签名下都被拒，说明服务端可能已不接受这份
+	// 匿名身份。清掉缓存后重新注册一次，再按六签名请求；有界且每 30 秒
+	// 最多轮换一次。
+	if !downloader.forgetHongguoPlaybackDevice(identity) {
+		return providerMedia{}, err
+	}
+	fresh, registerErr := downloader.hongguoPlaybackDevice(ctx)
+	if registerErr != nil {
+		return providerMedia{}, fmt.Errorf("%v；更换播放设备：%w", hongguoPlaybackUserMessage(err), registerErr)
+	}
+	return downloader.hongguoRegisteredAttempt(ctx, videoID, fresh, true, 3)
+}
+
+func (downloader *Downloader) hongguoRegisteredAttempt(ctx context.Context, videoID string, identity hongguoPlaybackIdentity, signed bool, attempt int) (providerMedia, error) {
+	mode := "unsigned"
+	if signed {
+		mode = "signed"
+	}
+	started := time.Now()
+	media, err := downloader.requestHongguoAppMedia(ctx, videoID, identity, signed)
+	message := fmt.Sprintf("attempt=%d mode=%s elapsed=%s", attempt, mode, time.Since(started).Round(time.Millisecond))
+	if err != nil {
+		message += " class=" + hongguoPlaybackFailureClass(err)
+	}
+	level := "info"
+	if err != nil {
+		level = "warning"
+	}
+	downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.attempt", Level: level, Source: sourceHongguo, Attempt: attempt, Quality: media.Quality, Message: message})
 	return media, err
 }
 
@@ -119,7 +165,7 @@ func (downloader *Downloader) requestHongguoAppMedia(ctx context.Context, videoI
 	}
 	entry := nestedMap(nestedMap(result, "data"), videoID)
 	if len(entry) == 0 {
-		return providerMedia{}, errors.New("红果批量接口未返回所选分集")
+		return providerMedia{}, errHongguoPlaybackMissingEpisode
 	}
 	model, err := hongguoVideoModel(entry)
 	if err != nil {
@@ -130,13 +176,17 @@ func (downloader *Downloader) requestHongguoAppMedia(ctx context.Context, videoI
 	}
 	fallback, err := hongguoFallbackAPI(model)
 	if err != nil {
-		return providerMedia{}, err
+		return providerMedia{}, hongguoPlaybackClassify(errHongguoPlaybackData, err.Error())
 	}
 	data, err := downloader.fetchHongguoFallbackVideoData(ctx, fallback)
 	if err != nil {
 		return providerMedia{}, err
 	}
-	return hongguoMediaFromFallbackData(model, data)
+	media, err := hongguoMediaFromFallbackData(model, data)
+	if err != nil {
+		return providerMedia{}, hongguoPlaybackClassify(errHongguoPlaybackData, err.Error())
+	}
+	return media, nil
 }
 
 func hongguoInlineMedia(model map[string]any, agent string) (providerMedia, error) {
@@ -151,7 +201,7 @@ func hongguoInlineMedia(model map[string]any, agent string) (providerMedia, erro
 		rows = append(rows, item)
 	}
 	if len(rows) == 0 {
-		return providerMedia{}, errors.New("本集片源缺少有效解密信息")
+		return providerMedia{}, hongguoPlaybackClassify(errHongguoPlaybackData, "本集片源缺少有效解密信息")
 	}
 	inline := make(map[string]any, len(model))
 	for key, value := range model {
@@ -211,19 +261,22 @@ func (downloader *Downloader) hongguoPlaybackJSON(request *http.Request, prepare
 		return nil, err
 	}
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusUnauthorized {
+			return nil, hongguoPlaybackClassify(errHongguoPlaybackAuth, fmt.Sprintf("%s HTTP %d", request.URL.Hostname(), response.StatusCode))
+		}
 		return nil, downloader.catalogResponseError(request, response, content)
 	}
 	if len(bytes.TrimSpace(content)) == 0 {
 		return nil, errHongguoPlaybackEmpty
 	}
 	if len(content) > providerMaxBodyBytes {
-		return nil, errors.New("红果播放接口响应过大")
+		return nil, hongguoPlaybackClassify(errHongguoPlaybackMalformed, "红果播放接口响应过大")
 	}
 	var result map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.UseNumber()
 	if decoder.Decode(&result) != nil || len(result) == 0 {
-		return nil, errors.New("红果播放接口返回格式异常")
+		return nil, errHongguoPlaybackMalformed
 	}
 	if err := hongguoPlaybackResponseError(result); err != nil {
 		return nil, err
@@ -234,7 +287,7 @@ func (downloader *Downloader) hongguoPlaybackJSON(request *http.Request, prepare
 func hongguoPlaybackResponseError(result map[string]any) error {
 	for _, code := range []string{mapString(result, "code"), mapString(result, "Code"), mapString(result, "status_code"), mapString(nestedMap(result, "BaseResp"), "StatusCode")} {
 		if code != "" && code != "0" {
-			return fmt.Errorf("红果播放接口暂不可用（%s）", truncate(code, 20))
+			return &hongguoPlaybackCodeError{code: code}
 		}
 	}
 	return nil

@@ -19,16 +19,33 @@ type cdnRoute struct {
 type cdnTransport struct {
 	base       *http.Transport
 	resolver   *dnsResolver
+	record     func(diagnosticEvent)
 	mu         sync.Mutex
 	transports map[string]*http.Transport
 	preferred  map[string]cdnRoute
 }
 
-func newCDNTransport(base *http.Transport, resolver *dnsResolver) *cdnTransport {
-	return &cdnTransport{base: base, resolver: resolver, transports: map[string]*http.Transport{}, preferred: map[string]cdnRoute{}}
+func newCDNTransport(base *http.Transport, resolver *dnsResolver, record ...func(diagnosticEvent)) *cdnTransport {
+	var recorder func(diagnosticEvent)
+	if len(record) > 0 {
+		recorder = record[0]
+	}
+	return &cdnTransport{base: base, resolver: resolver, record: recorder, transports: map[string]*http.Transport{}, preferred: map[string]cdnRoute{}}
 }
 
 func (transport *cdnTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	// 红果 App/注册接口是 POST，不经过下面的 CDN 分支；这里单独接住
+	// “no application protocol” 一类的 TLS 协商失败，按 HTTP/1.1、h2
+	// 各重试一次后再交给调用方。
+	if request.URL.Scheme == "https" && hongguoALPNHost(request.URL.Hostname()) {
+		response, err := transport.base.RoundTrip(request)
+		if err != nil && hongguoALPNRetryable(err) && request.Context().Err() == nil {
+			retried, retryErr := retryHongguoALPN(transport.base, request, err)
+			transport.recordALPN(request, err, retryErr)
+			return retried, retryErr
+		}
+		return response, err
+	}
 	if request.URL.Scheme != "https" || (!protectedCDNHost(request.URL.Hostname()) && request.Context().Value(nativeCoverNetworkKey{}) != true) || (request.Method != http.MethodGet && request.Method != http.MethodHead) {
 		return transport.base.RoundTrip(request)
 	}
@@ -93,6 +110,24 @@ func (transport *cdnTransport) RoundTrip(request *http.Request) (*http.Response,
 		}
 	}
 	return nil, fmt.Errorf("资源 %s 连接失败（已尝试备用 DNS 地址）: %w", request.URL.Hostname(), publicError(lastErr))
+}
+
+func (transport *cdnTransport) recordALPN(request *http.Request, original, retried error) {
+	if transport.record == nil || request == nil || request.URL == nil {
+		return
+	}
+	result := "failed"
+	if retried == nil {
+		result = "ok"
+	}
+	transport.record(diagnosticEvent{
+		Event:   "network.alpn_retry",
+		Level:   "warning",
+		Source:  sourceHongguo,
+		Host:    request.URL.Hostname(),
+		Attempt: 1,
+		Message: "first=" + hongguoALPNErrorLabel(original) + " result=" + result,
+	})
 }
 
 func (transport *cdnTransport) roundTripAddress(request *http.Request, proxyURL *url.URL, routeKey, address string) (*http.Response, error) {

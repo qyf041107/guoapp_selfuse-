@@ -1,5 +1,6 @@
 import 'core_bridge.dart';
 import 'models.dart';
+import 'xigua/network_exit.dart';
 
 class PlaybackLoader {
   PlaybackLoader(this.repository);
@@ -27,10 +28,10 @@ class PlaybackLoader {
       return plan;
     }
     return repository.resolve(drama, episode, quality: quality, adBlock: adBlock);
-  });
+  }, allowNetworkExit: !localOnly);
 
   Future<PlaybackPlan?> fallback(PlaybackPlan current) =>
-      _load(() => repository.fallback(current));
+      _load(() => repository.fallback(current), allowNetworkExit: true);
 
   Future<PlaybackPlan?> selectRoute(PlaybackPlan current, int route) =>
       _load(() => repository.selectRoute(current, route));
@@ -38,7 +39,10 @@ class PlaybackLoader {
   Future<PlaybackPlan?> use(PlaybackPlan prepared) =>
       _load(() async => prepared);
 
-  Future<PlaybackPlan?> _load(Future<PlaybackPlan> Function() resolve) async {
+  Future<PlaybackPlan?> _load(
+    Future<PlaybackPlan> Function() resolve, {
+    bool allowNetworkExit = false,
+  }) async {
     if (_closed) {
       return null;
     }
@@ -48,18 +52,44 @@ class PlaybackLoader {
       if (_closed || generation != _generation) {
         return null;
       }
-      final plan = await resolve();
-      if (_closed || generation != _generation) {
-        await repository.release(plan.session);
-        return null;
+      try {
+        return await _finish(await resolve(), generation);
+      } catch (error) {
+        // 出口被站源拒绝时，换物理网络只重试一次；浏览器验证页不触发。
+        if (!allowNetworkExit ||
+            _closed ||
+            generation != _generation ||
+            !NetworkExit.worthBypassing(error)) {
+          rethrow;
+        }
+        if (!await NetworkExit.borrow()) {
+          rethrow;
+        }
+        try {
+          await repository.resetNetwork();
+          await repository.cancelPlayback();
+          if (_closed || generation != _generation) {
+            return null;
+          }
+          return await _finish(await resolve(), generation);
+        } finally {
+          await NetworkExit.release();
+        }
       }
-      return plan;
     } catch (_) {
       if (_closed || generation != _generation) {
         return null;
       }
       rethrow;
     }
+  }
+
+  Future<PlaybackPlan?> _finish(PlaybackPlan plan, int generation) async {
+    if (_closed || generation != _generation) {
+      await repository.release(plan.session);
+      return null;
+    }
+    return plan;
   }
 
   Future<void> close() async {

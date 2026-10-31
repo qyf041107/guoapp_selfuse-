@@ -45,15 +45,63 @@ type nativeStreamSession struct {
 	adBlock      bool
 }
 
+type hongguoEdgeRoute struct {
+	host    string
+	expires time.Time
+}
+
 type nativeStreamServer struct {
-	mu         sync.Mutex
-	downloader *Downloader
-	address    string
-	sessions   map[string]*nativeStreamSession
-	server     *http.Server
+	mu            sync.Mutex
+	downloader    *Downloader
+	address       string
+	sessions      map[string]*nativeStreamSession
+	server        *http.Server
+	edgeMu        sync.Mutex
+	edgePreferred map[string]hongguoEdgeRoute
+	edgeBackoff   map[string]time.Time
 }
 
 func (stream *nativeStreamServer) nativeRequest(request *http.Request) (*http.Response, error) {
+	family, candidates, ok := hongguoMediaEdgeHosts(request.URL.String())
+	if !ok {
+		return stream.nativeRequestOnce(request, 1, "")
+	}
+	hosts := stream.hongguoEdgeCandidates(family, request.URL.Hostname(), candidates)
+	var held *http.Response
+	var lastErr error
+	for index, host := range hosts {
+		if index >= hongguoMediaEdgeMaxAttempts {
+			break
+		}
+		response, err := stream.nativeRequestOnce(stream.hongguoEdgeRequest(request, host), index+1, host)
+		if err != nil {
+			lastErr = err
+			stream.hongguoEdgeFailed(family, host, index+1, 0, "transport_error")
+			continue
+		}
+		if hongguoMediaEdgeRetryStatus(response.StatusCode) {
+			if held != nil {
+				held.Body.Close()
+			}
+			held = response
+			stream.hongguoEdgeFailed(family, host, index+1, response.StatusCode, fmt.Sprintf("http_%d", response.StatusCode))
+			continue
+		}
+		if held != nil {
+			held.Body.Close()
+		}
+		stream.hongguoEdgeSucceeded(family, host)
+		// 保留原签名主机，避免 HLS 相对地址按轮换后的 host 重写。
+		response.Request = request
+		return response, nil
+	}
+	if held != nil {
+		return held, nil
+	}
+	return nil, lastErr
+}
+
+func (stream *nativeStreamServer) nativeRequestOnce(request *http.Request, attempt int, edge string) (*http.Response, error) {
 	client := *stream.downloader.client
 	client.Timeout = 0
 	info, _ := request.Context().Value(nativeStreamDiagnosticKey{}).(nativeStreamDiagnostic)
@@ -61,20 +109,105 @@ func (stream *nativeStreamServer) nativeRequest(request *http.Request) (*http.Re
 		info.started = time.Now()
 	}
 	info.method = request.Method
-	stream.nativeLog(info, "upstream_start", request.URL.String(), "", 0, "")
+	detail := fmt.Sprintf("attempt=%d", attempt)
+	if edge != "" {
+		detail += " edge=" + edge
+	}
+	stream.nativeLog(info, "upstream_start", request.URL.String(), detail, 0, "")
 	request = request.WithContext(httptrace.WithClientTrace(request.Context(), stream.nativeTrace(info, request.URL.String())))
 	response, err := stream.downloader.doMediaRequestWithClient(request, &client)
 	if err != nil {
-		stream.nativeLog(info, "upstream_error", request.URL.String(), "error="+nativeStreamError(err), 0, "")
+		stream.nativeLog(info, "upstream_error", request.URL.String(), "error="+nativeStreamError(err)+" "+detail, 0, "")
 		return response, err
 	}
 	address := request.URL.String()
 	if response.Request != nil && response.Request.URL != nil {
 		address = response.Request.URL.String()
 	}
-	stream.nativeLog(info, "upstream_headers", address, "", response.StatusCode, response.Header.Get("Content-Type"))
+	stream.nativeLog(info, "upstream_headers", address, detail, response.StatusCode, response.Header.Get("Content-Type"))
 	response.Body = &nativeDiagnosticBody{ReadCloser: response.Body, stream: stream, info: info, address: address}
 	return response, nil
+}
+
+func (stream *nativeStreamServer) hongguoEdgeRequest(request *http.Request, host string) *http.Request {
+	if host == "" || strings.EqualFold(host, request.URL.Hostname()) {
+		return request
+	}
+	cloned := request.Clone(request.Context())
+	clonedURL := *request.URL
+	if port := request.URL.Port(); port != "" {
+		clonedURL.Host = net.JoinHostPort(host, port)
+	} else {
+		clonedURL.Host = host
+	}
+	cloned.URL = &clonedURL
+	return cloned
+}
+
+func (stream *nativeStreamServer) hongguoEdgeCandidates(family, original string, candidates []string) []string {
+	now := time.Now()
+	stream.edgeMu.Lock()
+	preferred := stream.edgePreferred[family]
+	backoffs := make(map[string]time.Time, len(stream.edgeBackoff))
+	for host, until := range stream.edgeBackoff {
+		backoffs[host] = until
+	}
+	stream.edgeMu.Unlock()
+
+	var hosts []string
+	add := func(host string, ignoreBackoff bool) {
+		if host == "" {
+			return
+		}
+		if until, blocked := backoffs[host]; blocked && now.Before(until) && !ignoreBackoff {
+			return
+		}
+		for _, existing := range hosts {
+			if strings.EqualFold(existing, host) {
+				return
+			}
+		}
+		hosts = append(hosts, host)
+	}
+	if preferred.host != "" && now.Before(preferred.expires) {
+		add(preferred.host, false)
+	}
+	// 原签名 host 永远尝试一次，即使刚失败过；否则所有候选都在退避时
+	// 会返回空列表。
+	add(original, true)
+	for _, host := range candidates {
+		add(host, false)
+	}
+	return hosts
+}
+
+func (stream *nativeStreamServer) hongguoEdgeSucceeded(family, host string) {
+	stream.edgeMu.Lock()
+	stream.edgePreferred[family] = hongguoEdgeRoute{host: host, expires: time.Now().Add(hongguoMediaEdgePreferredTTL)}
+	delete(stream.edgeBackoff, host)
+	if len(stream.edgePreferred) > 16 {
+		for key, route := range stream.edgePreferred {
+			if time.Now().After(route.expires) {
+				delete(stream.edgePreferred, key)
+			}
+		}
+	}
+	stream.edgeMu.Unlock()
+	stream.downloader.recordDiagnostic(diagnosticEvent{Event: "stream.cdn_edge", Level: "info", Source: sourceHongguo, Host: host, Message: "family=" + family + " outcome=ok"})
+}
+
+func (stream *nativeStreamServer) hongguoEdgeFailed(family, host string, attempt, status int, outcome string) {
+	stream.edgeMu.Lock()
+	stream.edgeBackoff[host] = time.Now().Add(hongguoMediaEdgeBackoff)
+	if len(stream.edgeBackoff) > 16 {
+		for key, until := range stream.edgeBackoff {
+			if time.Now().After(until) {
+				delete(stream.edgeBackoff, key)
+			}
+		}
+	}
+	stream.edgeMu.Unlock()
+	stream.downloader.recordDiagnostic(diagnosticEvent{Event: "stream.cdn_edge", Level: "warning", Source: sourceHongguo, Host: host, HTTPStatus: status, Attempt: attempt, Message: "family=" + family + " outcome=" + outcome})
 }
 
 var nativePlaylistURI = regexp.MustCompile(`URI="([^"]+)"`)
@@ -84,7 +217,7 @@ func newNativeStreamServer(d *Downloader) (*nativeStreamServer, error) {
 	if err != nil {
 		return nil, errors.New("无法初始化本机播放器")
 	}
-	stream := &nativeStreamServer{downloader: d, address: "http://" + listener.Addr().String(), sessions: map[string]*nativeStreamSession{}}
+	stream := &nativeStreamServer{downloader: d, address: "http://" + listener.Addr().String(), sessions: map[string]*nativeStreamSession{}, edgePreferred: map[string]hongguoEdgeRoute{}, edgeBackoff: map[string]time.Time{}}
 	server := &http.Server{Handler: http.HandlerFunc(stream.nativeServe), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16384}
 	stream.server = server
 	go func() {

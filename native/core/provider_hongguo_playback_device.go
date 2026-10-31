@@ -22,6 +22,13 @@ const hongguoPlaybackRegisterURL = "https://log5-applog-lf.fqnovel.com/service/2
 
 const hongguoRegisteredMediaUA = "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)"
 
+const (
+	hongguoPlaybackRegisterTimeout  = 8 * time.Second
+	hongguoPlaybackCooldownBase     = 15 * time.Second
+	hongguoPlaybackCooldownMax      = 2 * time.Minute
+	hongguoPlaybackRotationInterval = 30 * time.Second
+)
+
 type hongguoPlaybackIdentity struct {
 	deviceID  string
 	installID string
@@ -34,6 +41,14 @@ type hongguoPlaybackDeviceCall struct {
 	done     chan struct{}
 	identity hongguoPlaybackIdentity
 	err      error
+	retryAt  time.Time
+}
+
+func (client *hongguoAppClient) currentTime() time.Time {
+	if client != nil && client.now != nil {
+		return client.now()
+	}
+	return time.Now()
 }
 
 func newHongguoPlaybackUUID() (string, error) {
@@ -61,6 +76,24 @@ func (downloader *Downloader) hongguoPlaybackDeviceSession(ctx context.Context, 
 	if compatibility {
 		call = client.compatPlaybackDevice
 	}
+	start := false
+	if call != nil {
+		select {
+		case <-call.done:
+			// 失败结果只缓存一个冷却窗口。窗口结束后重新注册，避免注册
+			// 失败或设备被拒后必须重启应用才能恢复。
+			if call.err != nil && client.currentTime().Before(call.retryAt) {
+				cached := call.err
+				client.mu.Unlock()
+				return hongguoPlaybackIdentity{}, cached
+			}
+			if call.err != nil {
+				call = nil
+			}
+		default:
+			// 注册仍在进行，复用同一个 singleflight。
+		}
+	}
 	if call == nil {
 		call = &hongguoPlaybackDeviceCall{done: make(chan struct{})}
 		if compatibility {
@@ -68,34 +101,127 @@ func (downloader *Downloader) hongguoPlaybackDeviceSession(ctx context.Context, 
 		} else {
 			client.playbackDevice = call
 		}
-		go func() {
-			registrationCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			defer cancel()
-			var identity hongguoPlaybackIdentity
-			var err error
-			if compatibility {
-				identity.deviceID, identity.installID, err = downloader.registerHongguoDevice(registrationCtx)
-				if err == nil && (strings.Trim(identity.deviceID, "0") == "" || strings.Trim(identity.installID, "0") == "") {
-					err = errors.New("兼容播放设备号无效")
-				}
-			} else {
-				identity, err = downloader.registerHongguoPlaybackDevice(registrationCtx)
-			}
-			if err != nil {
-				call.err = errors.New("匿名播放设备注册失败，请检查网络或重启应用后重试")
-			} else {
-				call.identity = identity
-			}
-			close(call.done)
-		}()
+		start = true
 	}
 	client.mu.Unlock()
+	if start {
+		go downloader.runHongguoPlaybackRegistration(call, compatibility)
+	}
 	select {
 	case <-ctx.Done():
 		return hongguoPlaybackIdentity{}, ctx.Err()
 	case <-call.done:
 		return call.identity, call.err
 	}
+}
+
+func (downloader *Downloader) runHongguoPlaybackRegistration(call *hongguoPlaybackDeviceCall, compatibility bool) {
+	client := downloader.hongguoClient()
+	mode := "registered"
+	if compatibility {
+		mode = "compat"
+	}
+	downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.register_started", Level: "info", Source: sourceHongguo, Message: "mode=" + mode})
+
+	registrationCtx, cancel := context.WithTimeout(context.Background(), hongguoPlaybackRegisterTimeout)
+	defer cancel()
+	var identity hongguoPlaybackIdentity
+	var err error
+	if compatibility {
+		identity.deviceID, identity.installID, err = downloader.registerHongguoDevice(registrationCtx)
+		if err == nil && (strings.Trim(identity.deviceID, "0") == "" || strings.Trim(identity.installID, "0") == "") {
+			err = errors.New("兼容播放设备号无效")
+		}
+	} else {
+		identity, err = downloader.registerHongguoPlaybackDevice(registrationCtx)
+	}
+
+	client.mu.Lock()
+	now := client.currentTime()
+	if err != nil {
+		call.err = &hongguoPlaybackRegistrationError{cause: err}
+		failures := client.playbackFailures
+		if compatibility {
+			failures = client.compatPlaybackFailures
+		}
+		failures++
+		if compatibility {
+			client.compatPlaybackFailures = failures
+		} else {
+			client.playbackFailures = failures
+		}
+		call.retryAt = now.Add(hongguoPlaybackCooldown(failures))
+	} else {
+		call.identity = identity
+		call.err = nil
+		if compatibility {
+			client.compatPlaybackFailures = 0
+		} else {
+			client.playbackFailures = 0
+		}
+	}
+	retryAt := call.retryAt
+	client.mu.Unlock()
+
+	if err != nil {
+		cooldown := retryAt.Sub(now)
+		message := "mode=" + mode + " class=" + hongguoPlaybackFailureClass(err)
+		if cooldown > 0 {
+			message += " cooldown=" + cooldown.Round(time.Second).String()
+		}
+		downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.register_failed", Level: "warning", Source: sourceHongguo, Message: message})
+	} else {
+		downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.register_ready", Level: "info", Source: sourceHongguo, Message: "mode=" + mode})
+	}
+	close(call.done)
+}
+
+func hongguoPlaybackCooldown(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	delay := hongguoPlaybackCooldownBase
+	for attempt := 1; attempt < failures && delay < hongguoPlaybackCooldownMax; attempt++ {
+		delay *= 2
+	}
+	if delay > hongguoPlaybackCooldownMax {
+		delay = hongguoPlaybackCooldownMax
+	}
+	return delay
+}
+
+// forgetHongguoPlaybackDevice 只清除调用方实际使用过的那一份成功身份；
+// 不打断进行中的注册，也避免把刚注册好的新身份误删。30 秒内最多轮换
+// 一次，防止多集并发失败时触发注册风暴。
+func (downloader *Downloader) forgetHongguoPlaybackDevice(identity hongguoPlaybackIdentity) bool {
+	client := downloader.hongguoClient()
+	client.mu.Lock()
+	now := client.currentTime()
+	if !client.playbackRotatedAt.IsZero() && now.Sub(client.playbackRotatedAt) < hongguoPlaybackRotationInterval {
+		client.mu.Unlock()
+		downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.identity_rotation_suppressed", Level: "info", Source: sourceHongguo, Message: "reason=interval"})
+		return false
+	}
+	call := client.playbackDevice
+	if call == nil {
+		client.mu.Unlock()
+		return false
+	}
+	select {
+	case <-call.done:
+	default:
+		client.mu.Unlock()
+		return false
+	}
+	if call.err != nil || call.identity != identity {
+		client.mu.Unlock()
+		return false
+	}
+	client.playbackDevice = nil
+	client.playbackRotatedAt = now
+	client.mu.Unlock()
+	downloader.recordDiagnostic(diagnosticEvent{Event: "hongguo.playback.identity_rotated", Level: "info", Source: sourceHongguo})
+	return true
 }
 
 func hongguoRegisteredID(result map[string]any, name string) string {

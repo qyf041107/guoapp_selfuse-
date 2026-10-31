@@ -2,6 +2,23 @@
 
 每个版本一节，标题为 `pubspec.yaml` 中的完整版本号。发布工作流会把对应一节写入 GitHub Release 说明。
 
+## 0.3.3+92
+
+本版继续加固红果取流，重点解决「匿名设备注册失败后必须重启」「空响应只重试一次」「TLS 协商失败不恢复」「播放中单条 CDN 边缘失败」等断连场景。
+
+- 匿名播放设备注册失败不再永久缓存：15 秒起、按连续失败翻倍、最长 2 分钟冷却后自动重试；新增可安全遗忘身份的 `forgetHongguoPlaybackDevice`，只清除调用方实际使用过的那份身份，30 秒内最多轮换一次，避免多集并发失败触发注册风暴。
+- 六签名重试面扩大：空正文、HTTP 401、接口业务码非 0、播放信息格式异常、缺少 `video_model` 会先重签；仍失败时最多更换一次匿名设备号再签一次。403/429（limiter backoff）、5xx、TLS/EOF、缺失分集不会误触发换号。单次取流上限为 3 次播放请求、2 次注册、1 次轮换。
+- 红果失败增加结构化分类与统一用户文案（注册失败 / 鉴权被拒 / 当前网络被拒 / 连接中断 / 该集无片源 / 片源不可用），界面和日志不暴露设备号、签名头、媒体地址或 query。
+- 接通 `retryHongguoALPN`：`cdnTransport` 对 `fqnovel.com` / `snssdk.com` 的 TLS `no application protocol`、握手重置类错误依次用 HTTP/1.1、h2 重试，并复用 `GetBody` 重放 POST；DNS、证书、取消和普通超时不重试。同步移除已下线 `djapi` host 的 ALPN 白名单。
+- 本地播放代理新增 `tp1`–`tp8` 媒体边缘轮换：原 host 优先，403/429/500/502/503/504 或连接失败时按 `1,4,7,8,2,3,5,6` 有界换边，失败边退避 30 秒、成功边记忆 10 分钟；非 `tpN` 地址行为不变。
+- Android 实现 `vpnActive` / `bindPhysicalNetwork`：播放取流遇到可重试的出口错误时临时绑定物理网络，调用新增的原生 `resetNetwork`（关闭空闲连接、只清红果 host 的 backoff），重试一次后恢复；浏览器验证/Cloudflare 挑战不触发。
+- 播放日记新增 `hongguo.playback.*`、`network.alpn_retry`、`stream.cdn_edge` 事件，便于在 release 包内直接排查。
+- 测试：新增注册冷却/单飞/换身份、重试分类、ALPN、CDN 边缘、backoff 清理、NetworkExit 与 `PlaybackLoader` 单次重试等用例。
+- 验证（2026-10-31）：`go build ./core ./server`、`go vet ./core` 通过；`go test ./core` 的新增用例全部通过，仅剩两个既有失败（`TestDanmakuTruncationKeepsEmojiIntact`、`TestDuanjuRejectsMismatchedSourceIDsAndCategories`）。`flutter analyze` 仅剩 4 条既有 info；`flutter test test/network_exit_test.dart test/playback_loader_test.dart` 9/9 通过；完整 `flutter test` 仅剩 `rankings_screen_test.dart` 的既有封面异步异常（与本次改动文件无关）。
+- Android arm64 全源版 APK 构建通过（`dist/android/quanjushijie-0.3.3+92-arm64-v8a.apk`，包名 `com.duanju.duanju_app`，应用名“全剧视界”，签名证书 `CN=quanjushijie`）。
+- Android 真机实测（Xiaomi 2407FRK8EC，Android 16）：安装后应用正常启动，红果列表加载成功；第 1 集和第 48 集均能播放（1080×1920，本地代理 `http://127.0.0.1:...`）。播放日记记录 `hongguo.playback.register_started` → `register_ready` → `attempt`（`mode=unsigned`，171ms，1080P）→ `registered_resolved`，媒体 host 为 `dj-reading-video-x.qznovelvod.com`，证明匿名设备注册与注册设备取流链路生效。实测媒体 host 不是 `tpN` 形式，因此本次未触发 CDN 边缘轮换。
+- 构建环境补充：`android/gradle.properties` 关闭 Kotlin 增量编译，避免 pub 缓存在 C:、工程在 E: 时 Kotlin 增量缓存跨盘符报错；Windows 构建需从镜像补齐 media_kit 的 libmpv jar 与 Gradle 9.3.1 发行包。
+
 ## 0.3.2+91
 
 - 修复红果播放「红果 App 接口未返回有效数据」：旧 `/novel/player/video_model/v1/` 单集接口现在返回空正文（设备未注册 / 签名不被接受）。取流改为「匿名播放设备注册 + 六签名批量接口」：先调用 `log5-applog-lf.fqnovel.com/service/2/device_register/` 注册匿名设备（gzip + SHA-512 + AES-128-CBC 编码），再以该设备号、安装号、cdid 请求 `/novel/player/multi_video_model/v1/`，按需生成 X-Gorgon / X-Khronos / X-Ladon / X-Argus / X-Helios / X-Medusa 六种签名；返回的 `video_model` 若只给 `fallback_api`，再取 `video_info.data` 并用 `key_seed` 派生 AES-128-CBC 密钥解出媒体地址。原单集接口保留为兼容回退，注册失败或空响应时仍按「匿名注册 → 兼容注册 → 旧接口 → 预加载 → 官网网页」顺序降级。

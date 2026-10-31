@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:duanju_app/core_bridge.dart';
 import 'package:duanju_app/models.dart';
 import 'package:duanju_app/playback_loader.dart';
+import 'package:duanju_app/xigua/network_exit.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fixtures.dart';
@@ -40,7 +42,78 @@ class DeferredRepository extends FixtureRepository {
   Future<void> release(String session) async => released.add(session);
 }
 
+class NetworkRetryRepository extends FixtureRepository {
+  NetworkRetryRepository(this.failures);
+
+  final int failures;
+  int resolveCalls = 0;
+  int resets = 0;
+
+  @override
+  Future<PlaybackPlan> resolve(
+    Drama drama,
+    Episode episode, {
+    int quality = 0,
+    bool adBlock = true,
+  }) async {
+    resolveCalls++;
+    if (resolveCalls <= failures) {
+      throw AppFailure('connection reset by peer');
+    }
+    return const PlaybackPlan(
+      url: 'https://example.test/retry.mp4',
+      session: 'retry',
+    );
+  }
+
+  @override
+  Future<void> resetNetwork() async {
+    resets++;
+  }
+}
+
+class BrowserChallengeRepository extends FixtureRepository {
+  int resolveCalls = 0;
+  int resets = 0;
+
+  @override
+  Future<PlaybackPlan> resolve(
+    Drama drama,
+    Episode episode, {
+    int quality = 0,
+    bool adBlock = true,
+  }) async {
+    resolveCalls++;
+    throw AppFailure('站源要求浏览器验证');
+  }
+
+  @override
+  Future<void> resetNetwork() async {
+    resets++;
+  }
+}
+
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  const deviceChannel = MethodChannel('duanju/device');
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+
+  setUp(() {
+    NetworkExit.resetForTest();
+    NetworkExit.debugSupportedOverride = true;
+    messenger.setMockMethodCallHandler(deviceChannel, (call) async {
+      if (call.method == 'vpnActive') return true;
+      if (call.method == 'bindPhysicalNetwork') return true;
+      return null;
+    });
+  });
+
+  tearDown(() {
+    NetworkExit.resetForTest();
+    messenger.setMockMethodCallHandler(deviceChannel, null);
+  });
+
   Episode episode(int number) =>
       Episode({'id': '$number', 'currentEpisode': number}, number);
   Future<void> tick() => Future<void>.delayed(Duration.zero);
@@ -130,4 +203,42 @@ void main() {
       await loader.close();
     },
   );
+
+  test('retryable resolve failure switches exit and retries once', () async {
+    final repository = NetworkRetryRepository(1);
+    final loader = PlaybackLoader(repository);
+
+    final plan = await loader.load(FixtureRepository.free, episode(1));
+
+    expect(plan?.session, 'retry');
+    expect(repository.resolveCalls, 2);
+    expect(repository.resets, 1);
+    await loader.close();
+  });
+
+  test('browser verification never switches network exit', () async {
+    final repository = BrowserChallengeRepository();
+    final loader = PlaybackLoader(repository);
+
+    await expectLater(
+      loader.load(FixtureRepository.free, episode(1)),
+      throwsA(isA<AppFailure>()),
+    );
+    expect(repository.resolveCalls, 1);
+    expect(repository.resets, 0);
+    await loader.close();
+  });
+
+  test('a second failure is not retried again', () async {
+    final repository = NetworkRetryRepository(2);
+    final loader = PlaybackLoader(repository);
+
+    await expectLater(
+      loader.load(FixtureRepository.free, episode(1)),
+      throwsA(isA<AppFailure>()),
+    );
+    expect(repository.resolveCalls, 2);
+    expect(repository.resets, 1);
+    await loader.close();
+  });
 }

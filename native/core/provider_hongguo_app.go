@@ -38,22 +38,26 @@ type hongguoCatalogState struct {
 }
 
 type hongguoAppClient struct {
-	playbackDevice       *hongguoPlaybackDeviceCall
-	compatPlaybackDevice *hongguoPlaybackDeviceCall
-	mu                  sync.Mutex
-	catalogMu           sync.Mutex
-	deviceMu            sync.Mutex
-	registerPausedUntil time.Time
-	baseURL             string
-	state               hongguoCatalogState
-	details             map[string]hongguoDetailEntry
-	pending             map[string]*hongguoDetailCall
-	searches            map[string]hongguoSearchEntry
-	searchPending       map[string]*hongguoSearchCall
-	suggestions         map[string]hongguoSuggestionEntry
-	suggestPending      map[string]*hongguoSuggestionCall
-	danmaku             map[string]hongguoDanmakuCacheEntry
-	danmakuPending      map[string]*hongguoDanmakuCall
+	playbackDevice         *hongguoPlaybackDeviceCall
+	compatPlaybackDevice   *hongguoPlaybackDeviceCall
+	playbackFailures       int
+	compatPlaybackFailures int
+	playbackRotatedAt      time.Time
+	now                    func() time.Time
+	mu                     sync.Mutex
+	catalogMu              sync.Mutex
+	deviceMu               sync.Mutex
+	registerPausedUntil    time.Time
+	baseURL                string
+	state                  hongguoCatalogState
+	details                map[string]hongguoDetailEntry
+	pending                map[string]*hongguoDetailCall
+	searches               map[string]hongguoSearchEntry
+	searchPending          map[string]*hongguoSearchCall
+	suggestions            map[string]hongguoSuggestionEntry
+	suggestPending         map[string]*hongguoSuggestionCall
+	danmaku                map[string]hongguoDanmakuCacheEntry
+	danmakuPending         map[string]*hongguoDanmakuCall
 }
 
 func (downloader *Downloader) hongguoClient() *hongguoAppClient {

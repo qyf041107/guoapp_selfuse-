@@ -18,6 +18,8 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Rect
 import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.util.Rational
 import android.view.InputDevice
@@ -33,6 +35,8 @@ class MainActivity : FlutterActivity() {
     private var thermalHeadroom: Double? = null
     private var deviceChannel: MethodChannel? = null
     private var televisionMode = false
+    private var previousProcessNetwork: Network? = null
+    private var boundPhysicalNetwork: Network? = null
 
     @Suppress("DEPRECATION")
     private fun isTelevisionDevice(): Boolean {
@@ -114,6 +118,69 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    private fun vpnActive(): Boolean {
+        val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val active = connectivity.activeNetwork
+        if (active != null &&
+            connectivity.getNetworkCapabilities(active)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+            return true
+        }
+        return connectivity.allNetworks.any { network ->
+            connectivity.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        }
+    }
+
+    private fun bindPhysicalNetwork(): Boolean {
+        if (boundPhysicalNetwork != null) return true
+        val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val candidates = connectivity.allNetworks.mapNotNull { network ->
+            val capabilities = connectivity.getNetworkCapabilities(network) ?: return@mapNotNull null
+            val usable = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            if (!usable) return@mapNotNull null
+            val priority = when {
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 0
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 1
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 2
+                else -> return@mapNotNull null
+            }
+            Pair(network, priority)
+        }.sortedBy { it.second }.map { it.first }
+        val candidate = candidates.firstOrNull() ?: return false
+        return try {
+            previousProcessNetwork = connectivity.boundNetworkForProcess
+            connectivity.bindProcessToNetwork(candidate)
+            boundPhysicalNetwork = candidate
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun restorePhysicalNetwork(): Boolean {
+        if (boundPhysicalNetwork == null) return true
+        val connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        return try {
+            connectivity.bindProcessToNetwork(previousProcessNetwork)
+            previousProcessNetwork = null
+            boundPhysicalNetwork = null
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun onDestroy() {
+        restorePhysicalNetwork()
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         televisionMode = if (savedInstanceState?.containsKey("duanju.televisionMode") == true) {
             savedInstanceState.getBoolean("duanju.televisionMode")
@@ -162,6 +229,13 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         "playbackPower" -> result.success(runCatching { playbackPower() }.getOrNull())
+                        "vpnActive" -> result.success(vpnActive())
+                        "bindPhysicalNetwork" -> {
+                            val enabled = call.argument<Boolean>("enabled") ?: false
+                            result.success(
+                                if (enabled) bindPhysicalNetwork() else restorePhysicalNetwork()
+                            )
+                        }
                         "compatibleRendering" -> result.success(compatibleRendering())
                         "setCompatibleRendering" -> {
                             val enabled = call.argument<Boolean>("enabled")

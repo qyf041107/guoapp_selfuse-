@@ -236,6 +236,7 @@ abstract class AppRepository {
   Future<PlaybackPlan> selectRoute(PlaybackPlan current, int route) =>
       throw AppFailure('当前环境不支持切换播放线路');
   Future<void> cancelPlayback();
+  Future<void> resetNetwork() async {}
   Future<void> release(String session);
   Future<List<CustomSourceSite>> customSources() async => const [];
   Future<CustomSourceSite> addCustomSource({
@@ -884,6 +885,11 @@ class NativeRepository extends AppRepository {
   @override
   Future<void> cancelPlayback() async {
     await _call({'action': 'cancelPlayback', 'sequence': ++_playbackSequence});
+  }
+
+  @override
+  Future<void> resetNetwork() async {
+    await _call({'action': 'resetNetwork'});
   }
 
   @override

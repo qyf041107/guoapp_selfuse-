@@ -31,7 +31,7 @@ func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoI
 	if legacyErr == nil {
 		return media, nil
 	}
-	return providerMedia{}, fmt.Errorf("匿名设备取流：%v；兼容取流：%w", publicError(signedErr), legacyErr)
+	return providerMedia{}, fmt.Errorf("匿名设备取流：%v；兼容取流：%w", hongguoPlaybackUserMessage(signedErr), legacyErr)
 }
 
 func (downloader *Downloader) resolveHongguoLegacyAppMedia(ctx context.Context, videoID string) (providerMedia, error) {
@@ -71,14 +71,14 @@ func hongguoVideoModel(entry map[string]any) (map[string]any, error) {
 		if !strings.HasPrefix(encoded, "{") {
 			decoded, err := decodeHongguoBase64(encoded)
 			if err != nil {
-				return nil, errors.New("红果 App 播放信息编码异常")
+				return nil, hongguoPlaybackClassify(errHongguoPlaybackMalformed, "红果 App 播放信息编码异常")
 			}
 			encoded = string(decoded)
 		}
 		decoder := json.NewDecoder(strings.NewReader(encoded))
 		decoder.UseNumber()
 		if err := decoder.Decode(&model); err != nil || len(model) == 0 {
-			return nil, errors.New("红果 App 播放信息格式异常")
+			return nil, hongguoPlaybackClassify(errHongguoPlaybackMalformed, "红果 App 播放信息格式异常")
 		}
 	}
 	if len(model) == 0 && entry["video_list"] != nil {
@@ -87,7 +87,7 @@ func hongguoVideoModel(entry map[string]any) (map[string]any, error) {
 		}
 	}
 	if len(model) == 0 {
-		return nil, errors.New("红果 App 未返回本集播放信息")
+		return nil, hongguoPlaybackClassify(errHongguoPlaybackPayloadEmpty, "红果 App 未返回本集播放信息")
 	}
 	return model, nil
 }

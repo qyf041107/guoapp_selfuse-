@@ -1,8 +1,11 @@
 package core
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 
@@ -11,15 +14,66 @@ import (
 
 func hongguoALPNHost(host string) bool {
 	host = strings.ToLower(host)
-	if host == "djapi.999888456.xyz" {
-		return true
-	}
 	for _, domain := range []string{"fqnovel.com", "snssdk.com"} {
 		if host == domain || strings.HasSuffix(host, "."+domain) {
 			return true
 		}
 	}
 	return false
+}
+
+// hongguoALPNRetryable 只接受 TLS 协议协商/握手被重置一类的失败。DNS、
+// 证书、调用方取消和普通超时都不属于 ALPN 问题，换协议没有意义。
+func hongguoALPNRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return false
+	}
+	var certificateErr *tls.CertificateVerificationError
+	if errors.As(err, &certificateErr) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if strings.Contains(text, "certificate") || strings.Contains(text, "x509") {
+		return false
+	}
+	for _, signal := range []string{
+		"no application protocol",
+		"tls:",
+		"handshake",
+		"connection reset by peer",
+		"unexpected eof",
+	} {
+		if strings.Contains(text, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+func hongguoALPNErrorLabel(err error) string {
+	if err == nil {
+		return "none"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "no application protocol"):
+		return "no_application_protocol"
+	case strings.Contains(text, "connection reset"):
+		return "connection_reset"
+	case strings.Contains(text, "unexpected eof"):
+		return "unexpected_eof"
+	case strings.Contains(text, "handshake"):
+		return "handshake"
+	default:
+		return "transport"
+	}
 }
 
 func retryHongguoALPN(base *http.Transport, request *http.Request, original error) (*http.Response, error) {
@@ -47,16 +101,17 @@ func retryHongguoALPN(base *http.Transport, request *http.Request, original erro
 			transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 		}
 		transport.TLSClientConfig.NextProtos = []string{protocol}
-		defer transport.CloseIdleConnections()
 		upstream := request.Clone(request.Context())
 		if request.GetBody != nil {
 			body, err := request.GetBody()
 			if err != nil {
+				transport.CloseIdleConnections()
 				return nil, err
 			}
 			upstream.Body = body
 		}
 		response, err := transport.RoundTrip(upstream)
+		transport.CloseIdleConnections()
 		if err == nil {
 			return response, nil
 		}

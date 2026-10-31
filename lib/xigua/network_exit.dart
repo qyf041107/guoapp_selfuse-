@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'package:duanju_app/core_bridge.dart';
+import 'package:duanju_app/diary_service.dart';
 
 /// 站源的出口亲和性不一致：一部分站源对机房与代理 IP 直接重置 TLS 握手，
 /// 或者在 WAF 上拒绝，必须从本机网络出去；另一部分的媒体 CDN 恰好相反，
@@ -14,8 +15,20 @@ class NetworkExit {
   static const _channel = MethodChannel('duanju/device');
 
   static bool _borrowed = false;
+  static DateTime _lastBorrowAt = DateTime(2000);
 
-  static bool get supported => !kIsWeb && Platform.isAndroid;
+  @visibleForTesting
+  static bool? debugSupportedOverride;
+
+  static bool get supported =>
+      debugSupportedOverride ?? (!kIsWeb && Platform.isAndroid);
+
+  @visibleForTesting
+  static void resetForTest() {
+    _borrowed = false;
+    _lastBorrowAt = DateTime(2000);
+    debugSupportedOverride = null;
+  }
 
   static const _signals = <String>[
     'eof',
@@ -35,11 +48,18 @@ class NetworkExit {
     '连接超时',
     '无法连接',
     '连接被重置',
+    '连接被中断',
+    '注册失败',
   ];
 
   /// 浏览器验证类拦截判定的是出口 IP，换到物理网络只会更差，因此不触发
   /// 换出口重试，交给用户换节点。
-  static const _exitSignals = <String>['浏览器验证', 'just a moment'];
+  static const _exitSignals = <String>[
+    '浏览器验证',
+    'just a moment',
+    'cloudflare',
+    '验证页',
+  ];
 
   static bool worthBypassing(Object error) {
     final text = (error is AppFailure ? error.message : error.toString())
@@ -86,6 +106,9 @@ class NetworkExit {
 
   static Future<bool> borrow() async {
     if (!supported || _borrowed) return false;
+    if (DateTime.now().difference(_lastBorrowAt) < const Duration(seconds: 30)) {
+      return false;
+    }
     if (!await active()) return false;
     try {
       final bound =
@@ -93,9 +116,16 @@ class NetworkExit {
             'enabled': true,
           }) ??
           false;
-      _borrowed = bound;
+      if (bound) {
+        _borrowed = true;
+        _lastBorrowAt = DateTime.now();
+        DiaryService.add('[NetworkExit] borrow ok');
+      } else {
+        DiaryService.add('[NetworkExit] borrow failed');
+      }
       return bound;
     } catch (_) {
+      DiaryService.add('[NetworkExit] borrow failed');
       return false;
     }
   }
@@ -107,6 +137,7 @@ class NetworkExit {
       await _channel.invokeMethod<bool>('bindPhysicalNetwork', {
         'enabled': false,
       });
+      DiaryService.add('[NetworkExit] release');
     } catch (_) {
       // 恢复失败时忽略：下一次借用前会重新绑定。
     }

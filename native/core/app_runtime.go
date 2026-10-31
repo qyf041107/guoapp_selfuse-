@@ -284,7 +284,7 @@ func newNativeEngine(directory string) (*nativeEngine, error) {
 	transport.MaxIdleConnsPerHost = 8
 	transport.ResponseHeaderTimeout = 20 * time.Second
 	transport.Proxy = router.proxy
-	cdn := newCDNTransport(transport, newDNSResolver(transport))
+	cdn := newCDNTransport(transport, newDNSResolver(transport), d.recordDiagnostic)
 	browserTransport := newHuangguoBrowserTransport(cdn, d)
 	d.browserTransport = browserTransport
 	d.client = &http.Client{Transport: browserTransport, Timeout: 45 * time.Second,
@@ -423,6 +423,12 @@ func nativeDispatch(input nativeInput) (any, error) {
 		return engine.nativeLAN(ctx, input.Command, input.LAN)
 	case "updateSystemProxy":
 		return true, engine.updateSystemProxy(input.SystemProxy)
+	case "resetNetwork":
+		engine.downloader.client.CloseIdleConnections()
+		if engine.downloader.limiter != nil {
+			engine.downloader.limiter.clearHongguoBackoffs()
+		}
+		return true, nil
 	case "resourceSettings":
 		return engine.resourceSettings(), nil
 	case "saveResourceSettings":

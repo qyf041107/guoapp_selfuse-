@@ -229,6 +229,37 @@ func (body *limitedResponseBody) Close() error {
 	return err
 }
 
+// clearHongguoBackoffs 在 Android 临时切换网络出口后调用。只清理红果相关
+// host，避免把其他站源的退避也一起放开。
+func (limiter *requestLimiter) clearHongguoBackoffs() {
+	if limiter == nil {
+		return
+	}
+	limiter.mu.Lock()
+	for _, backoffs := range []map[string]*requestBackoff{limiter.backoffs, limiter.backgroundBackoffs} {
+		for host := range backoffs {
+			if hongguoNetworkHost(host) {
+				delete(backoffs, host)
+			}
+		}
+	}
+	limiter.notifyLocked()
+	limiter.mu.Unlock()
+}
+
+func hongguoNetworkHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, domain := range []string{
+		"fqnovel.com", "snssdk.com", "hongguoduanju.com",
+		"qznovelvod.com", "fqnovelvod.com", "douyinvod.com",
+	} {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Downloader) doCatalogRequestWithTimeout(request *http.Request, timeout time.Duration) (*http.Response, error) {
 	return d.doPreparedCatalogRequest(request, timeout, nil)
 }
