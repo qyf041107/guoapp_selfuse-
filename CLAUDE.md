@@ -112,7 +112,9 @@ flutter test
 
 当前状态（2026-10-31）：
 
-- 用户要求**先审核再提交**；尚未 commit，也尚未 push。
-- 审核通过后再提交并 push 到 `origin/main`（`https://github.com/qyf041107/guoapp_selfuse-.git`）。
+- 已提交 `f48780c` 并 push 到 `origin/main`（`https://github.com/qyf041107/guoapp_selfuse-.git`）。
+- 已创建 GitHub Release `app-v0.3.3-92`，附 Android arm64 APK：
+  `https://github.com/qyf041107/guoapp_selfuse-/releases/tag/app-v0.3.3-92`
+- 真机实测通过：红果列表、第 1/48 集播放、注册/取流日记均正常。
 
 注：`CLAUDE.md` 在 `.gitignore` 中（第 43 行），默认不会随代码提交；如需入库要先调整 `.gitignore`。
